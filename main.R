@@ -3,7 +3,7 @@ library(ggplot2)
 library(data.table)
 library(parallel)
 library(magrittr)
-source("read_matrix.R")
+source("aux_funcs.R")
 
 # Read example matrix with 13466 genes and 20 genome samples
 dt <- read_matrix("presence_absence_matrix.txt")
@@ -27,7 +27,7 @@ sub_dt$cel_freq <- unlist(parallel::mclapply(X = sub_dt$observed,
 
 
 # Merge all data back together
-dt <- merge.data.table(dt, sub_dt, c("gene", "observed", "n_samples", "crude_freq"), all = TRUE)
+dt <- data.table::merge.data.table(dt, sub_dt, c("gene", "observed", "n_samples", "crude_freq"), all = TRUE)
 
 # Frequency histogram
 dt[!is.na(cel_freq)][, .(gene, crude_freq, cel_freq)] %>% 
