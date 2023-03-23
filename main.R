@@ -1,94 +1,41 @@
 library(cmdstanr)
 library(ggplot2)
 library(data.table)
-source("utils.R")
+library(parallel)
+library(magrittr)
+source("read_matrix.R")
 
-# Number of genomes
-N <- 200
-# Number of genes
-K <- 25
-# Number of clusters
-C <- 3
+# Read example matrix with 13466 genes and 20 genome samples
+dt <- read_matrix("presence_absence_matrix.txt")
 
-# Generate random completeness for each sample
-completeness <- runif(N, 0.8, 1)
+# Compile stan model
+mod <- cmdstanr::cmdstan_model("pbsingle.stan")
 
-# Generate true frequencies at cluster level
-# beta distribution parameterised to give
-# nearly 0 or nearly 1 
-true_freq <- matrix(nrow = C, ncol = K)
-for(i in 1:C){
-  true_freq[i, ] <- rbeta(K, 0.15, 0.15)
-}
+# Generate random completeness for genome samples
+set.seed(23032023)
+completeness <- runif(20, 0.8, 0.99)
 
-# Generate random cluster relative sizes
-clust_rel_size <- gtools::rdirichlet(1, rep(2, 3))
+# Select genes with >50% crude frequency
+sub_dt <- dt[crude_freq > 0.5]
 
-# Assign samples to clusters based on sizes
-clust <- sample.int(n = C, size = N, 
-                    replace = TRUE, 
-                    prob = clust_rel_size)
-
-# Generates observed data from completeness and true frequencies
-dat <- matrix(nrow = N, ncol = K)
-for(i in 1:N){
-  for(j in 1:K){
-    dat[i, j] <- rbinom(1, size = 1, prob = completeness[i] * true_freq[clust[i], j])
-  }
-}
-
-# List of data for stan model
-data <- list(N = N,
-             K = K,
-             C = C,
-             dat = dat,
-             comp = completeness,
-             clust = clust)
-
-# Compile and run model
-mod <- cmdstan_model("cluster_model.stan")
-fit <- mod$sample(data = data, parallel_chains = 4)
-
-# Get posterior samples and format them
-res <- fit$draws("true_freq")
-dt <- as.data.table(res)
-dt[, clust := chop(variable, 1)]
-dt[, gene := chop(variable, 2)]
-dtall <- dt
-
-# 95% credible intervals for estimated frequency
-dt <- dt[, .(lq = quantile(value, 0.025), 
-             uq = quantile(value, 0.975)), c("gene", "clust")]
-
-# Create dataframe for the actual values
-real_data <- data.frame(freq = as.vector(t(true_freq)),
-                        gene = rep(1:K, C),
-                        clust = rep(1:C, rep(K, C)))
-
-# Plot estimates against actual
-ggplot(data = dt, aes(x = gene, ymin = lq, ymax = uq)) +
-  geom_errorbar() +
-  geom_point(data = real_data, inherit.aes = FALSE,
-             aes(x = gene, y = freq), col = "dodgerblue") +
-  labs(y = "True frequency", x = "Gene ID") +
-  facet_wrap(~clust)
+# Parallel apply to get Celebrimbor maximum likelihood estimate for each gene in subset of data
+sub_dt$cel_freq <- unlist(parallel::mclapply(X = sub_dt$observed, 
+                                            FUN = cel_ml, 
+                                            mc.cores = 8, 
+                                            N = 20, 
+                                            c = completeness))
 
 
-# Aggregates frequencies to the population level (over all clusters)
-real_all <- data.frame(freq = apply(X = true_freq, MARGIN = 2, FUN = function(x){
-  return(sum(x * clust_rel_size))
-}),
-gene = 1:K)
+# Merge all data back together
+dt <- merge.data.table(dt, sub_dt, c("gene", "observed", "n_samples", "crude_freq"), all = TRUE)
 
-# Aggregate model output to population level
-dtall <- dtall[, .(gene_freq = sum(value * clust_rel_size)), c("iteration", "gene", "chain")
-][, .(lq = quantile(gene_freq, 0.025), 
-      uq = quantile(gene_freq, 0.975)), c("gene")]
-
-# Plot population level actual vs estimates
-ggplot(dtall, aes(x = gene, ymin = lq, ymax = uq)) + 
-  geom_errorbar() +
-  geom_point(data = real_all, inherit.aes = FALSE,
-             aes(x = gene, y = freq), col = "dodgerblue") +
-  labs(y = "True frequency", x = "Gene ID")
-
+# Frequency histogram
+dt[!is.na(cel_freq)][, .(gene, crude_freq, cel_freq)] %>% 
+  melt.data.table(id.vars = "gene") %>% 
+  ggplot2::ggplot(aes(x = value, fill = variable)) + 
+  ggplot2::geom_histogram(position = position_dodge()) + 
+  ggplot2::geom_vline(xintercept = 0.95, lty = 2) +
+  ggplot2::scale_fill_discrete(name = "Estimate type", labels = c("crude", "celebrimbor")) +
+  ggplot2::labs(x = "Gene frequency (%)", y = "Number of genes") +
+  cowplot::theme_minimal_grid() +
+  ggplot2::scale_x_continuous(breaks = seq(0, 1, 0.1), labels = seq(0, 100, 10))
